@@ -43,16 +43,26 @@ class KeyPoolManager {
 
     const loaded = [];
 
-    // 1. Load from keys.txt if present (one key per line)
-    try {
-      if (fs.existsSync('keys.txt')) {
-        const lines = fs.readFileSync('keys.txt', 'utf8')
-          .split('\n')
-          .map(l => l.trim())
-          .filter(l => l && !l.startsWith('#'));
-        loaded.push(...lines);
-      }
-    } catch (_) {}
+    // 1. Load from keys.txt if present (checks local and workspace candidate paths)
+    const keyCandidates = [
+      'keys.txt',
+      'C:/Users/brosf/Documents/A vio projects/VioPls/testing/keys.txt',
+      'C:/Users/brosf/Documents/A vio projects/VioPls/proxy/keys.txt'
+    ];
+    for (const kp of keyCandidates) {
+      try {
+        if (fs.existsSync(kp)) {
+          const lines = fs.readFileSync(kp, 'utf8')
+            .split('\n')
+            .map(l => l.trim())
+            .filter(l => l && !l.startsWith('#'));
+          if (lines.length > 0) {
+            loaded.push(...lines);
+            break;
+          }
+        }
+      } catch (_) {}
+    }
 
     // 2. Load from comma/newline-separated BIKE4MIND_API_KEYS env var
     if (process.env.BIKE4MIND_API_KEYS) {
