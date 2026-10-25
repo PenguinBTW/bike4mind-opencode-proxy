@@ -354,7 +354,7 @@ async function transcribeImages(messages, apiKey) {
         if (report) {
           msg.content[j] = {
             type: 'text',
-            text: `[Visual Inspection Report: ${globalDirective.query}]\n\n${report}`
+            text: `[Visual Inspection Verifier Output for: "${globalDirective.query}"]\n${report}`
           };
           console.log('[Proxy Vision] Successfully produced empirical visual evidence report.');
         } else {
