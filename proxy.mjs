@@ -3,6 +3,9 @@
 import http from 'node:http';
 import fs from 'node:fs';
 
+// Tolerate local proxy / corporate SSL certificates on Windows
+process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
+
 const TARGET = process.env.BIKE4MIND_TARGET_URL || 'https://app.bike4mind.com/api/ai/v1/completions';
 const PORT = parseInt(process.env.PORT || '4000', 10);
 
