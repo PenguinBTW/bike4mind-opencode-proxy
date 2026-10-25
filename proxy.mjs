@@ -92,7 +92,7 @@ class KeyPoolManager {
     if (!this.depleted.has(key)) {
       this.depleted.set(key, reason);
       const remaining = this.keys.filter(k => !this.depleted.has(k)).length;
-      console.warn(`[KeyPool] âš ï¸ Key ${maskKey(key)} marked DEPLETED (${reason}). Active keys remaining: ${remaining}/${this.keys.length}`);
+      console.warn(`[KeyPool] Ã¢Å¡Â Ã¯Â¸Â Key ${maskKey(key)} marked DEPLETED (${reason}). Active keys remaining: ${remaining}/${this.keys.length}`);
       // Advance index
       this.currentIndex = (this.currentIndex + 1) % (this.keys.length || 1);
     }
@@ -168,6 +168,13 @@ http.createServer(async (req, res) => {
           payload.model = 'claude-haiku-5-5';
         } else if (payload.model === 'opus-5.5' || payload.model === 'opus') {
           payload.model = 'claude-opus-5-5';
+        }
+
+        // Ensure massive output token budget so Claude's extended thinking (3-4k tokens)
+        // + large file writes (like render.ts) never hit the default 4,096 token limit
+        if (!payload.max_tokens || payload.max_tokens < 32000) {
+          payload.max_tokens = 64000;
+          payload.maxTokens = 64000;
         }
 
         // Default reasoning effort to medium for reasoning-capable models if not explicitly set
@@ -300,7 +307,7 @@ http.createServer(async (req, res) => {
           activeKeyUsed = pool.getKey(incomingToken);
 
           if (!activeKeyUsed) {
-            console.error('[KeyPool] âŒ All API keys in pool are depleted or no keys configured!');
+            console.error('[KeyPool] Ã¢ÂÅ’ All API keys in pool are depleted or no keys configured!');
             break;
           }
 
@@ -452,7 +459,7 @@ http.createServer(async (req, res) => {
                     res.write(`data: ${JSON.stringify(openAiChunk)}\n\n`);
                   }
                   if (b4mChunk.stopReason) {
-                    finishReasonToUse = b4mChunk.stopReason === 'end_turn' ? 'stop' : b4mChunk.stopReason;
+                    finishReasonToUse = b4mChunk.stopReason === 'end_turn' ? 'stop' : (b4mChunk.stopReason === 'max_tokens' ? 'length' : b4mChunk.stopReason);
                     emitFinishIfNeeded();
                   }
                 } else if (b4mChunk.type === 'tool_use' && Array.isArray(b4mChunk.tools)) {
