@@ -427,96 +427,107 @@ http.createServer(async (req, res) => {
             res.write(`data: ${JSON.stringify(finishChunk)}\n\n`);
           };
 
-          while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
+          let seenDone = false;
+          try {
+            while (!seenDone) {
+              const { done, value } = await reader.read();
+              if (done) break;
 
-            buffer += decoder.decode(value, { stream: true });
-            const lines = buffer.split('\n');
-            buffer = lines.pop();
+              buffer += decoder.decode(value, { stream: true });
+              const lines = buffer.split('\n');
+              buffer = lines.pop();
 
-            for (const line of lines) {
-              const trimmed = line.trim();
-              if (!trimmed || !trimmed.startsWith('data:')) continue;
+              for (const line of lines) {
+                const trimmed = line.trim();
+                if (!trimmed || !trimmed.startsWith('data:')) continue;
 
-              const dataStr = trimmed.slice(5).trim();
-              if (dataStr === '[DONE]') {
-                emitFinishIfNeeded();
-                res.write('data: [DONE]\n\n');
-                continue;
-              }
-
-              try {
-                const b4mChunk = JSON.parse(dataStr);
-
-                if (b4mChunk.requestId) {
-                  requestId = b4mChunk.requestId;
-                }
-                if (b4mChunk.usage) {
-                  lastUsage = b4mChunk.usage;
+                const dataStr = trimmed.slice(5).trim();
+                if (dataStr === '[DONE]') {
+                  emitFinishIfNeeded();
+                  res.write('data: [DONE]\n\n');
+                  seenDone = true;
+                  break;
                 }
 
-                if (b4mChunk.type === 'content') {
-                  if (b4mChunk.text && !sentFinishReason) {
-                    const openAiChunk = {
-                      id: requestId,
-                      object: 'chat.completion.chunk',
-                      created: Math.floor(Date.now() / 1000),
-                      model: requestedModel,
-                      choices: [{
-                        index: 0,
-                        delta: { content: b4mChunk.text },
-                        finish_reason: null
-                      }]
-                    };
-                    res.write(`data: ${JSON.stringify(openAiChunk)}\n\n`);
-                  }
-                  if (b4mChunk.stopReason) {
-                    // Record finishReasonToUse, but do NOT prematurely emit finish chunk before [DONE]
-                    finishReasonToUse = b4mChunk.stopReason === 'end_turn'
-                      ? 'stop'
-                      : (b4mChunk.stopReason === 'max_tokens' ? 'length' : b4mChunk.stopReason);
-                  }
-                } else if (b4mChunk.type === 'tool_use' && Array.isArray(b4mChunk.tools)) {
-                  hasToolCalls = true;
+                try {
+                  const b4mChunk = JSON.parse(dataStr);
 
-                  if (!sentFinishReason) {
-                    for (let i = 0; i < b4mChunk.tools.length; i++) {
-                      const tool = b4mChunk.tools[i];
-                      const openAiToolChunk = {
+                  if (b4mChunk.requestId) {
+                    requestId = b4mChunk.requestId;
+                  }
+                  if (b4mChunk.usage) {
+                    lastUsage = b4mChunk.usage;
+                  }
+
+                  if (b4mChunk.type === 'content') {
+                    if (b4mChunk.text && !sentFinishReason) {
+                      const openAiChunk = {
                         id: requestId,
                         object: 'chat.completion.chunk',
                         created: Math.floor(Date.now() / 1000),
                         model: requestedModel,
                         choices: [{
                           index: 0,
-                          delta: {
-                            tool_calls: [{
-                              index: i,
-                              id: tool.id || `call_${Date.now()}_${i}`,
-                              type: 'function',
-                              function: {
-                                name: tool.name,
-                                arguments: formatToolArgs(tool.arguments)
-                              }
-                            }]
-                          },
+                          delta: { content: b4mChunk.text },
                           finish_reason: null
                         }]
                       };
-                      res.write(`data: ${JSON.stringify(openAiToolChunk)}\n\n`);
+                      res.write(`data: ${JSON.stringify(openAiChunk)}\n\n`);
+                    }
+                    if (b4mChunk.stopReason) {
+                      // Record finishReasonToUse, but do NOT prematurely emit finish chunk before [DONE]
+                      finishReasonToUse = b4mChunk.stopReason === 'end_turn'
+                        ? 'stop'
+                        : (b4mChunk.stopReason === 'max_tokens' ? 'length' : b4mChunk.stopReason);
+                    }
+                  } else if (b4mChunk.type === 'tool_use' && Array.isArray(b4mChunk.tools)) {
+                    hasToolCalls = true;
+
+                    if (!sentFinishReason) {
+                      for (let i = 0; i < b4mChunk.tools.length; i++) {
+                        const tool = b4mChunk.tools[i];
+                        const openAiToolChunk = {
+                          id: requestId,
+                          object: 'chat.completion.chunk',
+                          created: Math.floor(Date.now() / 1000),
+                          model: requestedModel,
+                          choices: [{
+                            index: 0,
+                            delta: {
+                              tool_calls: [{
+                                index: i,
+                                id: tool.id || `call_${Date.now()}_${i}`,
+                                type: 'function',
+                                function: {
+                                  name: tool.name,
+                                  arguments: formatToolArgs(tool.arguments)
+                                }
+                              }]
+                            },
+                            finish_reason: null
+                          }]
+                        };
+                        res.write(`data: ${JSON.stringify(openAiToolChunk)}\n\n`);
+                      }
                     }
                   }
+                } catch (e) {
+                  console.error('[Proxy Stream Chunk Error]:', e.message);
                 }
-              } catch (e) {
-                console.error('[Proxy Stream Chunk Error]:', e.message);
               }
             }
+          } catch (streamErr) {
+            // If upstream closes the connection (e.g. CloudFront socket teardown),
+            // log cleanly and let finally handle safe termination.
+            console.warn('[Proxy] Upstream stream disconnected:', streamErr.message);
+          } finally {
+            emitFinishIfNeeded();
+            clearInterval(keepaliveTimer);
+            if (!res.writableEnded) {
+              res.write('data: [DONE]\n\n');
+              res.end();
+            }
           }
-
-          emitFinishIfNeeded();
-          clearInterval(keepaliveTimer);
-          res.end();
         } else {
           // Non-streaming response collection
           let fullText = '';
@@ -588,6 +599,11 @@ http.createServer(async (req, res) => {
         if (!res.headersSent) {
           res.writeHead(500, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }).end(JSON.stringify({ error: err.message }));
         } else {
+          try {
+            if (!res.writableEnded) {
+              res.write('data: [DONE]\n\n');
+            }
+          } catch (_) {}
           res.end();
         }
       }
