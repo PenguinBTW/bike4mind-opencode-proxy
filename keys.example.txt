@@ -1,0 +1,7 @@
+# List your Bike4Mind API keys here (one per line).
+# The proxy will automatically rotate to the next key when one runs out of credits or hits a quota limit.
+# Lines starting with # are ignored.
+
+b4m_live_primary_key_here
+b4m_live_backup_key_1_here
+b4m_live_backup_key_2_here

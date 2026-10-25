@@ -1,8 +1,130 @@
 // proxy.mjs - Bridge between OpenAI-compatible clients (e.g. OpenCode) and Bike4Mind API
+// Includes automatic API key pooling, multi-key rotation, and zero-downtime credit exhaustion failover.
 import http from 'node:http';
+import fs from 'node:fs';
 
 const TARGET = process.env.BIKE4MIND_TARGET_URL || 'https://app.bike4mind.com/api/ai/v1/completions';
 const PORT = parseInt(process.env.PORT || '4000', 10);
+
+// Helper to mask keys for safe logging and status reporting
+function maskKey(key) {
+  if (!key || typeof key !== 'string') return 'none';
+  if (key.length <= 12) return '***';
+  return `${key.slice(0, 8)}...${key.slice(-4)}`;
+}
+
+// Key pool manager with live hot-reloading and depletion tracking
+class KeyPoolManager {
+  constructor() {
+    this.keys = [];
+    this.currentIndex = 0;
+    this.depleted = new Map(); // key -> reason string
+    this.loadKeys();
+  }
+
+  loadKeys() {
+    const loaded = [];
+
+    // 1. Load from keys.txt if present (one key per line)
+    try {
+      if (fs.existsSync('keys.txt')) {
+        const lines = fs.readFileSync('keys.txt', 'utf8')
+          .split('\n')
+          .map(l => l.trim())
+          .filter(l => l && !l.startsWith('#'));
+        loaded.push(...lines);
+      }
+    } catch (_) {}
+
+    // 2. Load from comma/newline-separated BIKE4MIND_API_KEYS env var
+    if (process.env.BIKE4MIND_API_KEYS) {
+      const envKeys = process.env.BIKE4MIND_API_KEYS
+        .split(/[,\n]/)
+        .map(k => k.trim())
+        .filter(Boolean);
+      loaded.push(...envKeys);
+    }
+
+    // 3. Fallback to single BIKE4MIND_API_KEY env var
+    if (process.env.BIKE4MIND_API_KEY) {
+      const single = process.env.BIKE4MIND_API_KEY.trim();
+      if (single && !loaded.includes(single)) {
+        loaded.push(single);
+      }
+    }
+
+    const unique = [...new Set(loaded)];
+    for (const k of unique) {
+      if (!this.keys.includes(k)) {
+        this.keys.push(k);
+      }
+    }
+  }
+
+  getKey(preferredKey = null) {
+    this.loadKeys();
+
+    // If client supplied a specific key that isn't depleted, try it first
+    if (preferredKey && !['pool', '{env:BIKE4MIND_API_KEY}', '***'].includes(preferredKey) && !this.depleted.has(preferredKey)) {
+      if (!this.keys.includes(preferredKey)) {
+        this.keys.push(preferredKey);
+      }
+      return preferredKey;
+    }
+
+    if (this.keys.length === 0) return null;
+
+    // Search for next non-depleted key in pool
+    for (let i = 0; i < this.keys.length; i++) {
+      const idx = (this.currentIndex + i) % this.keys.length;
+      const key = this.keys[idx];
+      if (!this.depleted.has(key)) {
+        this.currentIndex = idx;
+        return key;
+      }
+    }
+
+    return null; // All keys depleted
+  }
+
+  markDepleted(key, reason = 'insufficient_credits') {
+    if (!key) return;
+    if (!this.depleted.has(key)) {
+      this.depleted.set(key, reason);
+      const remaining = this.keys.filter(k => !this.depleted.has(k)).length;
+      console.warn(`[KeyPool] âš ï¸ Key ${maskKey(key)} marked DEPLETED (${reason}). Active keys remaining: ${remaining}/${this.keys.length}`);
+      // Advance index
+      this.currentIndex = (this.currentIndex + 1) % (this.keys.length || 1);
+    }
+  }
+
+  getStatus() {
+    this.loadKeys();
+    const active = this.keys.filter(k => !this.depleted.has(k));
+    return {
+      total: this.keys.length,
+      available: active.length,
+      depleted: this.depleted.size,
+      keys: this.keys.map((k, idx) => ({
+        index: idx + 1,
+        key: maskKey(k),
+        status: this.depleted.has(k) ? `depleted (${this.depleted.get(k)})` : (this.keys[this.currentIndex] === k ? 'active' : 'standby')
+      }))
+    };
+  }
+}
+
+const pool = new KeyPoolManager();
+console.log(`[KeyPool] Initialized with ${pool.keys.length} key(s) detected.`);
+
+// Checks if an upstream response indicates key exhaustion / invalidation
+function isDepletionError(status, bodyText) {
+  if (status === 401) return 'unauthorized / revoked';
+  if (status === 403 && /quota|limit|credit|forbidden/i.test(bodyText)) return 'forbidden / quota exceeded';
+  if (status === 422 && /insufficient_credits|spend_cap_exceeded|balance|credit/i.test(bodyText)) return 'insufficient_credits';
+  if (status === 429 && /quota|credit/i.test(bodyText)) return 'quota_exhausted';
+  return false;
+}
 
 http.createServer(async (req, res) => {
   // CORS preflight
@@ -15,14 +137,15 @@ http.createServer(async (req, res) => {
     return;
   }
 
-  // Health check
+  // Health check & Key Pool status
   if (req.method === 'GET') {
     res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify({
       status: 'ok',
-      provider: 'Bike4Mind Proxy',
+      provider: 'Bike4Mind Proxy (with Auto-Key Failover)',
+      port: PORT,
       target: TARGET,
-      port: PORT
-    }));
+      keyPool: pool.getStatus()
+    }, null, 2));
     return;
   }
 
@@ -141,30 +264,18 @@ http.createServer(async (req, res) => {
           payload.messages = translatedMessages;
         }
 
-        // Auth headers
-        const headers = {
-          'Content-Type': 'application/json',
-        };
-
-        const authHeader = req.headers['authorization'];
-        if (authHeader) {
-          headers['Authorization'] = authHeader;
-        } else if (process.env.BIKE4MIND_API_KEY) {
-          headers['Authorization'] = `Bearer ${process.env.BIKE4MIND_API_KEY}`;
-        }
-
-        const xApiKey = req.headers['x-api-key'];
-        if (xApiKey) {
-          headers['X-API-Key'] = xApiKey;
-        }
-
-        console.log(`[Proxy] Forwarding ${payload.model} (messages: ${payload.messages.length}, tools: ${payload.tools ? payload.tools.length : 0}) to B4M...`);
-
         const isClientStreaming = payload.stream !== false;
         const requestedModel = payload.model;
 
+        // Determine client incoming authorization header if any
+        let incomingToken = null;
+        const authHeader = req.headers['authorization'];
+        if (authHeader && authHeader.startsWith('Bearer ')) {
+          incomingToken = authHeader.slice(7).trim();
+        }
+
+        // Start SSE response headers immediately to prevent OpenCode client header timeout
         if (isClientStreaming) {
-          // Immediately acknowledge OpenCode with HTTP 200 and SSE headers to prevent client header timeout
           res.writeHead(200, {
             'Content-Type': 'text/event-stream',
             'Cache-Control': 'no-cache',
@@ -172,40 +283,93 @@ http.createServer(async (req, res) => {
             'Access-Control-Allow-Origin': '*'
           });
           res.write(': keepalive\n\n');
+        }
 
-          // Keep connection alive with periodic SSE comments while model thinks
-          const keepaliveTimer = setInterval(() => {
-            if (!res.writableEnded) {
-              res.write(': keepalive\n\n');
-            }
-          }, 8000);
+        const keepaliveTimer = setInterval(() => {
+          if (!res.writableEnded && isClientStreaming) {
+            res.write(': keepalive\n\n');
+          }
+        }, 8000);
 
-          let upstream;
+        // Failover retry loop: try keys from pool until success or all depleted
+        let upstream = null;
+        let activeKeyUsed = null;
+        const maxAttempts = Math.max(1, pool.keys.length);
+
+        for (let attempt = 0; attempt < maxAttempts; attempt++) {
+          activeKeyUsed = pool.getKey(incomingToken);
+
+          if (!activeKeyUsed) {
+            console.error('[KeyPool] âŒ All API keys in pool are depleted or no keys configured!');
+            break;
+          }
+
+          const headers = {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${activeKeyUsed}`
+          };
+
+          console.log(`[Proxy] Forwarding ${payload.model} (key: ${maskKey(activeKeyUsed)}, messages: ${payload.messages.length}) to B4M...`);
+
           try {
             upstream = await fetch(TARGET, {
               method: 'POST',
               headers,
               body: JSON.stringify(payload),
             });
-          } catch (fetchErr) {
-            clearInterval(keepaliveTimer);
-            console.error('[Proxy] Fetch network error:', fetchErr);
-            res.write(`data: ${JSON.stringify({ error: { message: fetchErr.message } })}\n\n`);
-            res.write('data: [DONE]\n\n');
-            res.end();
-            return;
+          } catch (netErr) {
+            console.error(`[Proxy] Network error with key ${maskKey(activeKeyUsed)}:`, netErr.message);
+            continue;
           }
 
-          if (!upstream.ok) {
-            clearInterval(keepaliveTimer);
-            const errText = await upstream.text();
+          if (upstream.ok) {
+            // Success! Proceed to stream or return response
+            break;
+          }
+
+          // Check if failure is due to credit exhaustion, invalidation, or rate limit
+          const errText = await upstream.text();
+          const depletionReason = isDepletionError(upstream.status, errText);
+
+          if (depletionReason) {
+            console.warn(`[Proxy] Upstream ${upstream.status} indicates key exhaustion (${depletionReason}) on key ${maskKey(activeKeyUsed)}. Auto-switching to next key...`);
+            pool.markDepleted(activeKeyUsed, depletionReason);
+            incomingToken = null; // force pool selection on next attempt
+            upstream = null;
+            continue;
+          } else {
+            // Other error (e.g. 400 bad request, schema error) - don't rotate key
             console.error(`[Proxy] Upstream error ${upstream.status}:`, errText);
-            res.write(`data: ${JSON.stringify({ error: { message: `Upstream error ${upstream.status}: ${errText}` } })}\n\n`);
-            res.write('data: [DONE]\n\n');
-            res.end();
+            clearInterval(keepaliveTimer);
+            if (isClientStreaming) {
+              res.write(`data: ${JSON.stringify({ error: { message: `Upstream error ${upstream.status}: ${errText}` } })}\n\n`);
+              res.write('data: [DONE]\n\n');
+              res.end();
+            } else {
+              res.writeHead(upstream.status, { 'Content-Type': 'application/json' }).end(errText);
+            }
             return;
           }
+        }
 
+        if (!upstream || !upstream.ok) {
+          clearInterval(keepaliveTimer);
+          const failureMsg = pool.keys.length === 0
+            ? 'No Bike4Mind API keys configured in proxy.'
+            : 'All Bike4Mind API keys in pool are exhausted or unavailable.';
+          console.error(`[KeyPool] Request aborted: ${failureMsg}`);
+          if (isClientStreaming) {
+            res.write(`data: ${JSON.stringify({ error: { message: failureMsg } })}\n\n`);
+            res.write('data: [DONE]\n\n');
+            res.end();
+          } else {
+            res.writeHead(422, { 'Content-Type': 'application/json' }).end(JSON.stringify({ error: failureMsg }));
+          }
+          return;
+        }
+
+        // Process successful response
+        if (isClientStreaming) {
           let requestId = 'chatcmpl-' + Date.now();
           let buffer = '';
           let hasToolCalls = false;
@@ -249,7 +413,7 @@ http.createServer(async (req, res) => {
 
             buffer += decoder.decode(value, { stream: true });
             const lines = buffer.split('\n');
-            buffer = lines.pop(); // keep last unfinished line
+            buffer = lines.pop();
 
             for (const line of lines) {
               const trimmed = line.trim();
@@ -311,7 +475,7 @@ http.createServer(async (req, res) => {
                               type: 'function',
                               function: {
                                 name: tool.name,
-                                arguments: typeof tool.arguments === 'string' ? tool.arguments : JSON.stringify(tool.arguments || {})
+                                arguments: typeof t.arguments === 'string' ? t.arguments : JSON.stringify(t.arguments || {})
                               }
                             }]
                           },
@@ -333,24 +497,6 @@ http.createServer(async (req, res) => {
           res.end();
         } else {
           // Non-streaming response collection
-          let upstream;
-          try {
-            upstream = await fetch(TARGET, {
-              method: 'POST',
-              headers,
-              body: JSON.stringify(payload),
-            });
-          } catch (err) {
-            res.writeHead(500, { 'Content-Type': 'application/json' }).end(JSON.stringify({ error: err.message }));
-            return;
-          }
-
-          if (!upstream.ok) {
-            const errText = await upstream.text();
-            res.writeHead(upstream.status, { 'Content-Type': 'application/json' }).end(errText);
-            return;
-          }
-
           let fullText = '';
           let toolCalls = [];
           let usage = null;
@@ -380,7 +526,7 @@ http.createServer(async (req, res) => {
                     type: 'function',
                     function: {
                       name: t.name,
-                      arguments: typeof t.arguments === 'string' ? tool.arguments : JSON.stringify(t.arguments || {})
+                      arguments: typeof t.arguments === 'string' ? t.arguments : JSON.stringify(t.arguments || {})
                     }
                   })));
                 }
@@ -410,6 +556,7 @@ http.createServer(async (req, res) => {
             } : undefined
           };
 
+          clearInterval(keepaliveTimer);
           res.writeHead(200, {
             'Content-Type': 'application/json',
             'Access-Control-Allow-Origin': '*'

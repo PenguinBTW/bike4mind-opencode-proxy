@@ -1,50 +1,83 @@
 # Bike4Mind OpenCode Proxy Shim
 
-A lightweight translation proxy that enables **[OpenCode](https://opencode.ai)** (and other OpenAI-compatible coding agent CLIs) to use **[Bike4Mind](https://app.bike4mind.com)** as an LLM provider.
+A lightweight translation proxy that enables **[OpenCode](https://opencode.ai)** (and other OpenAI-compatible coding agent CLIs) to use **[Bike4Mind](https://app.bike4mind.com)** as an LLM provider with **multi-key pooling and zero-downtime failover**.
 
 ---
 
-## Why This Proxy is Needed
+## Key Features
 
-OpenCode uses Vercel's AI SDK (`@ai-sdk/openai-compatible`) which sends standard OpenAI `/chat/completions` payloads. Bike4Mind's API (`/api/ai/v1/completions`) has distinct architectural differences:
-
-1. **Tool Definition Schema**: Bike4Mind expects `{ toolSchema: { name, description, parameters } }` instead of OpenAI's `{ type: "function", function: { ... } }`.
-2. **Multi-turn Tool Calling**: Bike4Mind rejects `role: "tool"` and requires Anthropic-style content blocks (`tool_use` in assistant messages and `tool_result` in user messages).
-3. **SSE Stream Normalization**: Bike4Mind streams proprietary `content` and `tool_use` events. The proxy converts them into OpenAI delta chunks and guarantees clean, single `finish_reason` terminations.
-4. **Reasoning Defaults**: Automatically injects medium reasoning effort for frontier reasoning models (`claude-sonnet-5-5`, `claude-opus-5-5`).
-5. **Anti-Timeout Keepalive**: Immediately acknowledges clients with HTTP 200 headers and emits background SSE keepalive pings (`: keepalive`), preventing client timeouts during heavy reasoning phases on large multi-turn contexts.
+1. **Tool Definition Schema Translation**: Converts standard OpenAI `{ type: "function", function: { ... } }` into Bike4Mind's `{ toolSchema: { name, description, parameters } }`.
+2. **Multi-turn Anthropic Tool Calling Protocol**: Bridges OpenAI's `role: "tool"` into Anthropic-style `tool_use` and `tool_result` content blocks with message merging.
+3. **SSE Stream Normalization**: Translates proprietary Bike4Mind SSE events into OpenAI delta chunks with clean single `finish_reason` terminations.
+4. **Automatic Multi-Key Failover & Pooling**: Hot-reloads API keys from `keys.txt` or environment variables; automatically rotates to a backup key when one runs out of credits (`insufficient_credits`, 401, 403 quota, 429).
+5. **Anti-Timeout SSE Keepalive**: Emits HTTP 200 headers immediately and pings `: keepalive` every 8s to prevent client timeouts during deep thinking phases on large contexts.
+6. **Built-in Model Aliasing**: Map simple names (`sonnet`, `haiku`, `opus`) directly to official Bike4Mind identifiers with automatic medium reasoning effort defaults.
 
 ---
 
 ## Quick Start
 
-### 1. Set Your Bike4Mind API Key
-Export your live key in your shell:
+### 1. Configure Your API Key(s)
 
-**PowerShell (Windows):**
+You can provide keys in any of the following ways (in priority order):
+
+#### Option A: `keys.txt` File (Recommended for Multi-Key Failover)
+Create a `keys.txt` file in the proxy directory (one key per line):
+```text
+b4m_live_key_1_here
+b4m_live_key_2_here
+b4m_live_key_3_here
+```
+> [!NOTE]
+> `keys.txt` is already listed in `.gitignore` so your keys are never committed. The proxy hot-reloads `keys.txt` on every request, so you can paste in new keys while the proxy is actively running without restarting it!
+
+#### Option B: Environment Variable (Multiple Keys)
+```powershell
+$env:BIKE4MIND_API_KEYS = "b4m_live_key1,b4m_live_key2,b4m_live_key3"
+```
+
+#### Option C: Single Key
 ```powershell
 $env:BIKE4MIND_API_KEY = "b4m_live_your_key_here"
 ```
 
-**Bash / Zsh (macOS / Linux):**
-```bash
-export BIKE4MIND_API_KEY="b4m_live_your_key_here"
-```
+---
 
 ### 2. Start the Proxy
+
 ```bash
 node proxy.mjs
 ```
-The proxy will start on `http://localhost:4000/v1`.
+
+You should see:
+```text
+[KeyPool] Initialized with 2 key(s) detected.
+[B4M Proxy] Listening on http://localhost:4000/v1
+```
+
+---
+
+## How Automatic Key Failover Works
+
+When running heavy coding agents, Claude Sonnet 5.5 consumes credits across long multi-turn sessions. If a key runs out mid-session:
+
+1. Bike4Mind returns an exhaustion error (`422 insufficient_credits`, `401 unauthorized`, `403 quota`, or `429`).
+2. The proxy intercepts the error, marks the failing key as `depleted`, and logs:
+   ```text
+   [KeyPool] ⚠️ Key b4m_live...9a81a marked DEPLETED (insufficient_credits). Active keys remaining: 1/2
+   [Proxy] Upstream 422 indicates key exhaustion. Auto-switching to next key...
+   ```
+3. The proxy immediately retries the exact same prompt with the next standby key in the pool.
+4. OpenCode receives a successful stream seamlessly — **no dropped sessions, no broken terminal turns, and no manual restarts**.
 
 ---
 
 ## Configuring OpenCode
 
-You can configure OpenCode in one of two ways:
+You can configure OpenCode either locally (per project) or globally (across all projects):
 
 ### Option A: Per-Project Configuration (Local)
-Copy [`opencode.json`](./opencode.json) into the root of any workspace you want to work in:
+Copy [`opencode.json`](./opencode.json) into the root of any workspace:
 
 ```json
 {
@@ -89,13 +122,11 @@ Copy [`opencode.json`](./opencode.json) into the root of any workspace you want 
 ```
 
 ### Option B: Global Configuration (All Projects)
-To use Bike4Mind across **all** repositories without copying config files each time:
-
 Place the configuration in your global OpenCode config path:
 * **Windows**: `C:\Users\<YourUsername>\.config\opencode\opencode.json`
 * **macOS / Linux**: `~/.config/opencode/opencode.json`
 
-Once set globally, simply run `opencode` in any directory.
+Once set globally, simply run `opencode` anywhere without needing a local config file.
 
 ---
 
@@ -107,14 +138,14 @@ Launch OpenCode in your workspace:
 opencode
 ```
 * Press **Tab** to switch between Plan Agent and Build Agent.
-* Type `/models` to open the model selector and pick any configured model.
+* Type `/models` to open the interactive picker and select any configured model.
 
 ### From the Command Line
 ```bash
 # Run a one-off prompt using Sonnet 5.5
 opencode run --model bike4mind/claude-sonnet-5-5 "Create hello.py, run it, and show output"
 
-# Run with Haiku for quick edits
+# Run with Haiku for fast edits
 opencode run --model bike4mind/claude-haiku-5-5 "Check git status and summarize recent commits"
 ```
 
@@ -132,26 +163,31 @@ opencode run --model bike4mind/claude-haiku-5-5 "Check git status and summarize 
 
 ---
 
-## Health Check & Verification
+## Health Check & Key Pool Status
 
-Test if the proxy is running and responsive:
+Check proxy health and pool capacity:
 ```bash
 curl http://localhost:4000
 ```
-Expected response:
-```json
-{"status":"ok","provider":"Bike4Mind Proxy","target":"https://app.bike4mind.com/api/ai/v1/completions","port":4000}
-```
 
-Test a quick tool-call completion directly through the proxy:
-```bash
-curl -X POST "http://localhost:4000/v1/chat/completions" \
-  -H "Authorization: Bearer $BIKE4MIND_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "claude-sonnet-5-5",
-    "messages": [{"role": "user", "content": "How many r'\''s in strawberry?"}]
-  }'
+Response:
+```json
+{
+  "status": "ok",
+  "provider": "Bike4Mind Proxy (with Auto-Key Failover)",
+  "port": 4000,
+  "target": "https://app.bike4mind.com/api/ai/v1/completions",
+  "keyPool": {
+    "total": 3,
+    "available": 2,
+    "depleted": 1,
+    "keys": [
+      { "index": 1, "key": "b4m_live...9a81a", "status": "depleted (insufficient_credits)" },
+      { "index": 2, "key": "b4m_live...1b2c3", "status": "active" },
+      { "index": 3, "key": "b4m_live...4d5e6", "status": "standby" }
+    ]
+  }
+}
 ```
 
 ---
@@ -159,7 +195,7 @@ curl -X POST "http://localhost:4000/v1/chat/completions" \
 ## Troubleshooting
 
 ### Self-Signed / Corporate Certificate Errors (`UNABLE_TO_VERIFY_LEAF_SIGNATURE`)
-If your environment inspects TLS traffic, Node's `fetch` may fail certificate verification. Start the proxy with TLS rejection disabled in your terminal:
+If your environment inspects TLS traffic, start the proxy with TLS rejection disabled:
 ```powershell
 $env:NODE_TLS_REJECT_UNAUTHORIZED = "0"
 node proxy.mjs
