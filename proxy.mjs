@@ -272,7 +272,7 @@ async function executeVisionInspection(imageBlocks, directive, apiKey) {
       body: JSON.stringify({
         model: 'claude-haiku-5-5',
         messages: [{ role: 'user', content }],
-        max_tokens: 3000
+        max_tokens: 1200
       })
     });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
