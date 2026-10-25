@@ -166,16 +166,90 @@ function isDepletionError(status, bodyText) {
   return false;
 }
 
-// Vision Sidecar: Transcribe image blocks into structured technical text
-async function transcribeImageBlock(imgBlock, apiKey) {
-  const prompt = 'Analyze this motion design screenshot or rendered frame. Describe in detail: 1. Visual elements, layout, subject. 2. Colors, lighting, glow, bloom. 3. Camera angle, framing, depth of field. 4. Visual bugs, clipping, Z-fighting, black screens, or missing elements. Be concise and technical.';
+// Vision Sidecar: Directive Parser for targeted frame verification
+function parseVisionDirective(text) {
+  if (!text || typeof text !== 'string') return null;
+  const tagMatch = text.match(/\{(?:\~\~|\~\~")([\s\S]*?)(?:\~\~"|\~\~\})/);
+  if (!tagMatch) return null;
 
-  let formattedBlock = imgBlock;
-  if (imgBlock.type === 'image_url' && imgBlock.image_url?.url) {
-    formattedBlock = {
-      type: 'image_url',
-      image_url: { url: imgBlock.image_url.url }
-    };
+  let raw = tagMatch[1].trim();
+  if (raw.startsWith('"') && raw.endsWith('"')) raw = raw.slice(1, -1).trim();
+
+  let region = null;
+  const regionMatch = raw.match(/region\s*=\s*\[?\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\]?/i);
+  if (regionMatch) {
+    region = [parseInt(regionMatch[1], 10), parseInt(regionMatch[2], 10), parseInt(regionMatch[3], 10), parseInt(regionMatch[4], 10)];
+    raw = raw.replace(regionMatch[0], '').trim();
+  }
+
+  let comparePath = null;
+  const compareMatch = raw.match(/compare\s*=\s*["']?([^"'\s]+)["']?/i);
+  if (compareMatch) {
+    comparePath = compareMatch[1].trim();
+    raw = raw.replace(compareMatch[0], '').trim();
+  }
+
+  const afterTag = text.slice(tagMatch.index + tagMatch[0].length).trim();
+  let imagePath = null;
+  const pathRegex = /([a-zA-Z]:[\\\/][^\s"'<>]+\.(?:png|jpe?g|webp|bmp)|(?:\.{1,2}[\\\/]|[a-zA-Z0-9_\-\.\/\\\\]+?)\.(?:png|jpe?g|webp|bmp))/i;
+  const pathMatch = afterTag.match(pathRegex) || text.match(pathRegex);
+  if (pathMatch) imagePath = pathMatch[0].trim();
+
+  return {
+    rawMatch: tagMatch[0],
+    query: raw.replace(/^["'\s]+|["'\s]+$/g, '').trim(),
+    region,
+    comparePath,
+    imagePath
+  };
+}
+
+function buildVisionPrompt(directive) {
+  let prompt = `You are a pixel-accurate motion design visual inspection verifier.
+Your job is to answer the user's specific questions with empirical visual evidence, NOT generic commentary.
+
+USER QUESTIONS:
+${directive.query}
+`;
+
+  if (directive.region) {
+    const [x, y, w, h] = directive.region;
+    prompt += `\nCRITICAL REGION FOCUS:
+You must focus your visual inspection specifically within the bounding box:
+X=${x}, Y=${y}, Width=${w}, Height=${h} (within standard 1920x1080 frame). Zoom in mentally to this specific area to answer the questions.\n`;
+  }
+
+  if (directive.comparePath) {
+    prompt += `\nCOMPARE MODE:
+You are inspecting two frames (Frame A and Frame B) across a transition seam or cut.
+Examine continuity, alignment, lighting changes, shader pops, or visual jumps between the two frames.\n`;
+  }
+
+  prompt += `
+MANDATORY RULES:
+1. Answer each numbered question (Q1, Q2, etc.) directly.
+2. Format each answer with a clear Yes / No / Value, followed immediately by concrete spatial evidence (coordinates like ~x=600, ~y=450, colors, ring/gap/edge positions).
+   Example of good answer: "Yes: ring left at ~x=600, red bar centre at x=960, square right at x=1240".
+   Example of BAD answer: "Yes, it looks good" or "All elements pass".
+3. ANOMALIES / DEFECTS (UNASKED): Even if not asked, if you see any obvious visual defects, clipping, Z-fighting, black screen, missing shaders, NaN colors, overlapping text, or glitched geometry, list them under this section with their locations. If no defects are observed, write "None observed".
+`;
+  return prompt;
+}
+
+// Vision Sidecar: Transcribe image blocks into structured empirical visual evidence
+async function executeVisionInspection(imageBlocks, directive, apiKey) {
+  const prompt = buildVisionPrompt(directive);
+  const content = [{ type: 'text', text: prompt }];
+
+  for (const block of imageBlocks) {
+    if (block.type === 'image_url' && block.image_url?.url) {
+      content.push({ type: 'image_url', image_url: { url: block.image_url.url } });
+    } else if (block.type === 'image' && block.source) {
+      content.push({
+        type: 'image_url',
+        image_url: { url: `data:${block.source.media_type || 'image/png'};base64,${block.source.data}` }
+      });
+    }
   }
 
   try {
@@ -184,21 +258,14 @@ async function transcribeImageBlock(imgBlock, apiKey) {
       headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
       body: JSON.stringify({
         model: 'claude-haiku-5-5',
-        messages: [{
-          role: 'user',
-          content: [
-            { type: 'text', text: prompt },
-            formattedBlock
-          ]
-        }],
-        max_tokens: 500
+        messages: [{ role: 'user', content }],
+        max_tokens: 3000
       })
     });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const text = await res.text();
     let desc = '';
-    const lines = text.split('\n');
-    for (const l of lines) {
+    for (const l of text.split('\n')) {
       if (l.startsWith('data:') && !l.includes('[DONE]')) {
         try {
           const chunk = JSON.parse(l.slice(5).trim());
@@ -208,13 +275,41 @@ async function transcribeImageBlock(imgBlock, apiKey) {
     }
     return desc.trim();
   } catch (err) {
-    console.warn('[Proxy Vision] Transcription error:', err.message);
+    console.warn('[Proxy Vision] Targeted inspection error:', err.message);
     return null;
   }
 }
 
 async function transcribeImages(messages, apiKey) {
   if (!Array.isArray(messages)) return;
+
+  // 1. Locate any vision directive tag across messages
+  let globalDirective = null;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (typeof m.content === 'string') {
+      const d = parseVisionDirective(m.content);
+      if (d) { globalDirective = d; break; }
+    } else if (Array.isArray(m.content)) {
+      for (const b of m.content) {
+        if (b && typeof b.text === 'string') {
+          const d = parseVisionDirective(b.text);
+          if (d) { globalDirective = d; break; }
+        }
+      }
+      if (globalDirective) break;
+    }
+    if (Array.isArray(m.tool_calls)) {
+      for (const tc of m.tool_calls) {
+        const rawArgs = typeof tc.function?.arguments === 'string' ? tc.function.arguments : JSON.stringify(tc.function?.arguments || '');
+        const d = parseVisionDirective(rawArgs);
+        if (d) { globalDirective = d; break; }
+      }
+      if (globalDirective) break;
+    }
+  }
+
+  // 2. Process image blocks
   for (let i = 0; i < messages.length; i++) {
     const msg = messages[i];
     const isLatestTurn = i >= messages.length - 2;
@@ -231,21 +326,86 @@ async function transcribeImages(messages, apiKey) {
           continue;
         }
 
-        // For the active/latest image, transcribe it using claude-haiku-5-5
-        console.log('[Proxy Vision] Intercepted image inspection. Transcribing via claude-haiku-5-5...');
-        const desc = await transcribeImageBlock(block, apiKey);
-        if (desc) {
+        // For the active/latest image: check if query directive was provided
+        if (!globalDirective) {
+          console.log('[Proxy Vision] Image present but no query directive tag found. Returning explicit failure message.');
           msg.content[j] = {
             type: 'text',
-            text: `[Visual Inspection Report of Screenshot]:\n${desc}`
+            text: '[Vision Inspection Error: No query directive given]\nFormat required: {~~"Specific questions to verify (Q1: ..., Q2: ...)"~~} [region=[x,y,w,h]] [compare="path/to/second_frame.png"]]'
           };
-          console.log('[Proxy Vision] Successfully transcribed image to text (saved ~3,000 vision tokens and context bloat).');
+          continue;
+        }
+
+        console.log(`[Proxy Vision] Intercepted targeted image query: "${globalDirective.query.slice(0, 60)}..." Transcribing via claude-haiku-5-5...`);
+        const report = await executeVisionInspection([block], globalDirective, apiKey);
+        if (report) {
+          msg.content[j] = {
+            type: 'text',
+            text: `[Visual Inspection Report: ${globalDirective.query}]\n\n${report}`
+          };
+          console.log('[Proxy Vision] Successfully produced empirical visual evidence report.');
         } else {
           msg.content[j] = {
             type: 'text',
-            text: '[Visual Inspection Report: Screenshot capture processed, no critical visual errors detected.]'
+            text: `[Visual Inspection Error: Failed to execute vision inspection for query "${globalDirective.query}". Please retry.]`
           };
         }
+      }
+    }
+  }
+
+  // 3. Check for standalone file-path directive in text (e.g. {~~"..."~~} path/to/frame.png)
+  // If present and image exists on disk, load and inspect even without client image block upload!
+  if (globalDirective && globalDirective.imagePath) {
+    const rawPath = globalDirective.imagePath;
+    let resolvedPath = rawPath;
+    if (!fs.existsSync(resolvedPath)) {
+      const candidates = [
+        rawPath,
+        `C:/Users/brosf/Documents/A vio projects/VioPls/Agentic motion design toolset/app/${rawPath}`,
+        `C:/Users/brosf/Documents/A vio projects/VioPls/Agentic motion design toolset/${rawPath}`,
+        `C:/Users/brosf/Documents/A vio projects/VioPls/${rawPath}`
+      ];
+      for (const c of candidates) {
+        if (fs.existsSync(c)) { resolvedPath = c; break; }
+      }
+    }
+
+    if (fs.existsSync(resolvedPath)) {
+      console.log(`[Proxy Vision] Found disk image from directive at: ${resolvedPath}. Inspecting...`);
+      try {
+        const fileBuf = fs.readFileSync(resolvedPath);
+        const b64 = fileBuf.toString('base64');
+        const ext = resolvedPath.endsWith('.jpg') || resolvedPath.endsWith('.jpeg') ? 'jpeg' : 'png';
+        const imgBlock = {
+          type: 'image_url',
+          image_url: { url: `data:image/${ext};base64,${b64}` }
+        };
+
+        const imageBlocks = [imgBlock];
+        if (globalDirective.comparePath && fs.existsSync(globalDirective.comparePath)) {
+          const compBuf = fs.readFileSync(globalDirective.comparePath);
+          const compB64 = compBuf.toString('base64');
+          const compExt = globalDirective.comparePath.endsWith('.jpg') || globalDirective.comparePath.endsWith('.jpeg') ? 'jpeg' : 'png';
+          imageBlocks.push({
+            type: 'image_url',
+            image_url: { url: `data:image/${compExt};base64,${compB64}` }
+          });
+        }
+
+        const report = await executeVisionInspection(imageBlocks, globalDirective, apiKey);
+        if (report) {
+          const latestMsg = messages[messages.length - 1];
+          const reportBlock = `\n\n[Visual Inspection Report for ${globalDirective.imagePath}]:\nQuery: ${globalDirective.query}\n\n${report}`;
+          if (typeof latestMsg.content === 'string') {
+            latestMsg.content += reportBlock;
+          } else if (Array.isArray(latestMsg.content)) {
+            latestMsg.content.push({ type: 'text', text: reportBlock });
+          }
+          console.log('[Proxy Vision] Appended disk-image visual inspection report to message.');
+        }
+      } catch (diskErr) {
+        console.warn('[Proxy Vision] Error reading disk image:', diskErr.message);
       }
     }
   }
