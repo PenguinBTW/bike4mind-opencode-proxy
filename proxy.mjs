@@ -92,7 +92,7 @@ class KeyPoolManager {
     if (!this.depleted.has(key)) {
       this.depleted.set(key, reason);
       const remaining = this.keys.filter(k => !this.depleted.has(k)).length;
-      console.warn(`[KeyPool] ÃƒÂ¢Ã…Â¡Ã‚Â ÃƒÂ¯Ã‚Â¸Ã‚Â Key ${maskKey(key)} marked DEPLETED (${reason}). Active keys remaining: ${remaining}/${this.keys.length}`);
+      console.warn(`[KeyPool] [!] Key ${maskKey(key)} marked DEPLETED (${reason}). Active keys remaining: ${remaining}/${this.keys.length}`);
       // Advance index
       this.currentIndex = (this.currentIndex + 1) % (this.keys.length || 1);
     }
@@ -307,7 +307,7 @@ http.createServer(async (req, res) => {
           activeKeyUsed = pool.getKey(incomingToken);
 
           if (!activeKeyUsed) {
-            console.error('[KeyPool] ÃƒÂ¢Ã‚ÂÃ…â€™ All API keys in pool are depleted or no keys configured!');
+            console.error('[KeyPool] [x] All API keys in pool are depleted or no keys configured!');
             break;
           }
 
@@ -482,7 +482,7 @@ http.createServer(async (req, res) => {
                               type: 'function',
                               function: {
                                 name: tool.name,
-                                arguments: typeof t.arguments === 'string' ? t.arguments : JSON.stringify(t.arguments || {})
+                                arguments: typeof tool.arguments === 'string' ? tool.arguments : JSON.stringify(tool.arguments || {})
                               }
                             }]
                           },
@@ -494,7 +494,7 @@ http.createServer(async (req, res) => {
                   }
                 }
               } catch (e) {
-                // If not valid JSON, ignore
+                console.error('[Proxy Stream Chunk Error]:', e.message);
               }
             }
           }
