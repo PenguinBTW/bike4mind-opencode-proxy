@@ -92,7 +92,7 @@ class KeyPoolManager {
     if (!this.depleted.has(key)) {
       this.depleted.set(key, reason);
       const remaining = this.keys.filter(k => !this.depleted.has(k)).length;
-      console.warn(`[KeyPool] Ã¢Å¡Â Ã¯Â¸Â Key ${maskKey(key)} marked DEPLETED (${reason}). Active keys remaining: ${remaining}/${this.keys.length}`);
+      console.warn(`[KeyPool] ÃƒÂ¢Ã…Â¡Ã‚Â ÃƒÂ¯Ã‚Â¸Ã‚Â Key ${maskKey(key)} marked DEPLETED (${reason}). Active keys remaining: ${remaining}/${this.keys.length}`);
       // Advance index
       this.currentIndex = (this.currentIndex + 1) % (this.keys.length || 1);
     }
@@ -172,9 +172,9 @@ http.createServer(async (req, res) => {
 
         // Ensure massive output token budget so Claude's extended thinking (3-4k tokens)
         // + large file writes (like render.ts) never hit the default 4,096 token limit
-        if (!payload.max_tokens || payload.max_tokens < 32000) {
-          payload.max_tokens = 64000;
-          payload.maxTokens = 64000;
+        if (!payload.max_tokens || payload.max_tokens < 128000) {
+          payload.max_tokens = 128000;
+          payload.maxTokens = 128000;
         }
 
         // Default reasoning effort to medium for reasoning-capable models if not explicitly set
@@ -307,7 +307,7 @@ http.createServer(async (req, res) => {
           activeKeyUsed = pool.getKey(incomingToken);
 
           if (!activeKeyUsed) {
-            console.error('[KeyPool] Ã¢ÂÅ’ All API keys in pool are depleted or no keys configured!');
+            console.error('[KeyPool] ÃƒÂ¢Ã‚ÂÃ…â€™ All API keys in pool are depleted or no keys configured!');
             break;
           }
 
