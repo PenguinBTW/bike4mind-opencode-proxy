@@ -150,19 +150,19 @@ function isDepletionError(status, bodyText) {
   if (status === 422) {
     try {
       const parsed = JSON.parse(bodyText);
-      const err = parsed.error || parsed.errorCode || '';
-      const msg = parsed.message || '';
-      if (typeof err === 'string' && /insufficient_credits|spend_cap_exceeded|balance_too_low|quota_exceeded/i.test(err)) {
-        return err;
+      const code = parsed.errorCode || '';
+      const text = `${parsed.error || ''} ${parsed.message || ''}`.trim();
+      if (/insufficient_credits|spend_cap_exceeded|balance_too_low|quota_exceeded/i.test(code)) {
+        return code || 'insufficient_credits';
       }
-      if (typeof msg === 'string' && /insufficient.*credit|not enough credit|spend.*cap/i.test(msg)) {
+      if (/insufficient.*credit|not enough credit|spend.*cap/i.test(text)) {
         return 'insufficient_credits';
       }
     } catch (_) {
-      if (/insufficient_credits|spend_cap_exceeded/i.test(bodyText)) return 'insufficient_credits';
+      if (/insufficient.*credit|spend_cap/i.test(bodyText)) return 'insufficient_credits';
     }
   }
-  if (status === 429 && /quota|rate_limit_exceeded/i.test(bodyText)) return 'quota_exhausted';
+  if (status === 429) return 'rate_limited';
   return false;
 }
 
