@@ -11,7 +11,9 @@ A lightweight translation proxy that enables **[OpenCode](https://opencode.ai)**
 3. **SSE Stream Normalization**: Translates proprietary Bike4Mind SSE events into OpenAI delta chunks with clean single `finish_reason` terminations.
 4. **Automatic Multi-Key Failover & Pooling**: Hot-reloads API keys from `keys.txt` or environment variables; automatically rotates to a backup key when one runs out of credits (`insufficient_credits`, 401, 403 quota, 429).
 5. **Anti-Timeout SSE Keepalive**: Emits HTTP 200 headers immediately and pings `: keepalive` every 8s to prevent client timeouts during deep thinking phases on large contexts.
-6. **Built-in Model Aliasing**: Map simple names (`sonnet`, `haiku`, `opus`) directly to official Bike4Mind identifiers with automatic medium reasoning effort defaults.
+6. **Full 128k Output Budget**: Automatically grants the full 128,000 output token limit supported by Anthropic 5.5 models so extended reasoning never starves long code file writes.
+7. **Compaction Ready**: Fully supports OpenCode session compaction (`/compact`) and 1M context windows.
+8. **Built-in Model Aliasing**: Maps simple names (`sonnet`, `haiku`, `opus`) directly to official Bike4Mind identifiers with automatic medium reasoning effort defaults.
 
 ---
 
