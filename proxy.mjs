@@ -13,16 +13,34 @@ function maskKey(key) {
   return `${key.slice(0, 8)}...${key.slice(-4)}`;
 }
 
-// Key pool manager with live hot-reloading and depletion tracking
+// Safely normalize tool call arguments to a valid JSON string
+function formatToolArgs(raw) {
+  if (typeof raw === 'string') return raw;
+  if (raw && typeof raw === 'object') {
+    try {
+      return JSON.stringify(raw);
+    } catch (_) {
+      return '{}';
+    }
+  }
+  return '{}';
+}
+
+// Key pool manager with debounced caching and live depletion tracking
 class KeyPoolManager {
   constructor() {
     this.keys = [];
     this.currentIndex = 0;
     this.depleted = new Map(); // key -> reason string
-    this.loadKeys();
+    this.lastLoad = 0;
+    this.loadKeys(true);
   }
 
-  loadKeys() {
+  loadKeys(force = false) {
+    // 2-second debounce to avoid hitting disk on rapid agent tool loops
+    if (!force && Date.now() - this.lastLoad < 2000) return;
+    this.lastLoad = Date.now();
+
     const loaded = [];
 
     // 1. Load from keys.txt if present (one key per line)
@@ -54,10 +72,11 @@ class KeyPoolManager {
     }
 
     const unique = [...new Set(loaded)];
-    for (const k of unique) {
-      if (!this.keys.includes(k)) {
-        this.keys.push(k);
-      }
+    this.keys = unique;
+    if (this.keys.length > 0) {
+      this.currentIndex = this.currentIndex % this.keys.length;
+    } else {
+      this.currentIndex = 0;
     }
   }
 
@@ -93,14 +112,16 @@ class KeyPoolManager {
       this.depleted.set(key, reason);
       const remaining = this.keys.filter(k => !this.depleted.has(k)).length;
       console.warn(`[KeyPool] [!] Key ${maskKey(key)} marked DEPLETED (${reason}). Active keys remaining: ${remaining}/${this.keys.length}`);
-      // Advance index
-      this.currentIndex = (this.currentIndex + 1) % (this.keys.length || 1);
+      if (this.keys.length > 0) {
+        this.currentIndex = (this.currentIndex + 1) % this.keys.length;
+      }
     }
   }
 
   getStatus() {
-    this.loadKeys();
+    this.loadKeys(true);
     const active = this.keys.filter(k => !this.depleted.has(k));
+    const safeIdx = this.keys.length > 0 ? this.currentIndex % this.keys.length : 0;
     return {
       total: this.keys.length,
       available: active.length,
@@ -108,7 +129,7 @@ class KeyPoolManager {
       keys: this.keys.map((k, idx) => ({
         index: idx + 1,
         key: maskKey(k),
-        status: this.depleted.has(k) ? `depleted (${this.depleted.get(k)})` : (this.keys[this.currentIndex] === k ? 'active' : 'standby')
+        status: this.depleted.has(k) ? `depleted (${this.depleted.get(k)})` : (this.keys[safeIdx] === k ? 'active' : 'standby')
       }))
     };
   }
@@ -170,7 +191,7 @@ http.createServer(async (req, res) => {
           payload.model = 'claude-opus-5-5';
         }
 
-        // Ensure massive output token budget so Claude's extended thinking (3-4k tokens)
+        // Ensure full 128k output token budget so Claude's extended thinking (3-4k tokens)
         // + large file writes (like render.ts) never hit the default 4,096 token limit
         if (!payload.max_tokens || payload.max_tokens < 128000) {
           payload.max_tokens = 128000;
@@ -281,24 +302,8 @@ http.createServer(async (req, res) => {
           incomingToken = authHeader.slice(7).trim();
         }
 
-        // Start SSE response headers immediately to prevent OpenCode client header timeout
-        if (isClientStreaming) {
-          res.writeHead(200, {
-            'Content-Type': 'text/event-stream',
-            'Cache-Control': 'no-cache',
-            'Connection': 'keep-alive',
-            'Access-Control-Allow-Origin': '*'
-          });
-          res.write(': keepalive\n\n');
-        }
-
-        const keepaliveTimer = setInterval(() => {
-          if (!res.writableEnded && isClientStreaming) {
-            res.write(': keepalive\n\n');
-          }
-        }, 8000);
-
         // Failover retry loop: try keys from pool until success or all depleted
+        // Notice: headers are NOT sent yet, preserving true HTTP status codes (401, 422, 500) if all keys fail!
         let upstream = null;
         let activeKeyUsed = null;
         const maxAttempts = Math.max(1, pool.keys.length);
@@ -330,7 +335,7 @@ http.createServer(async (req, res) => {
           }
 
           if (upstream.ok) {
-            // Success! Proceed to stream or return response
+            // Success! Break out of retry loop
             break;
           }
 
@@ -345,38 +350,46 @@ http.createServer(async (req, res) => {
             upstream = null;
             continue;
           } else {
-            // Other error (e.g. 400 bad request, schema error) - don't rotate key
+            // Other error (e.g. 400 bad request, schema error) - don't rotate key, return real HTTP status
             console.error(`[Proxy] Upstream error ${upstream.status}:`, errText);
-            clearInterval(keepaliveTimer);
-            if (isClientStreaming) {
-              res.write(`data: ${JSON.stringify({ error: { message: `Upstream error ${upstream.status}: ${errText}` } })}\n\n`);
-              res.write('data: [DONE]\n\n');
-              res.end();
-            } else {
-              res.writeHead(upstream.status, { 'Content-Type': 'application/json' }).end(errText);
-            }
+            res.writeHead(upstream.status, {
+              'Content-Type': 'application/json',
+              'Access-Control-Allow-Origin': '*'
+            }).end(errText);
             return;
           }
         }
 
         if (!upstream || !upstream.ok) {
-          clearInterval(keepaliveTimer);
           const failureMsg = pool.keys.length === 0
             ? 'No Bike4Mind API keys configured in proxy.'
             : 'All Bike4Mind API keys in pool are exhausted or unavailable.';
           console.error(`[KeyPool] Request aborted: ${failureMsg}`);
-          if (isClientStreaming) {
-            res.write(`data: ${JSON.stringify({ error: { message: failureMsg } })}\n\n`);
-            res.write('data: [DONE]\n\n');
-            res.end();
-          } else {
-            res.writeHead(422, { 'Content-Type': 'application/json' }).end(JSON.stringify({ error: failureMsg }));
-          }
+          // Return honest 422 HTTP status to the client
+          res.writeHead(422, {
+            'Content-Type': 'application/json',
+            'Access-Control-Allow-Origin': '*'
+          }).end(JSON.stringify({ error: { message: failureMsg, type: 'insufficient_credits', code: 422 } }));
           return;
         }
 
         // Process successful response
         if (isClientStreaming) {
+          // Send 200 SSE headers now that upstream is confirmed healthy
+          res.writeHead(200, {
+            'Content-Type': 'text/event-stream',
+            'Cache-Control': 'no-cache',
+            'Connection': 'keep-alive',
+            'Access-Control-Allow-Origin': '*'
+          });
+          res.write(': keepalive\n\n');
+
+          const keepaliveTimer = setInterval(() => {
+            if (!res.writableEnded) {
+              res.write(': keepalive\n\n');
+            }
+          }, 8000);
+
           let requestId = 'chatcmpl-' + Date.now();
           let buffer = '';
           let hasToolCalls = false;
@@ -459,8 +472,10 @@ http.createServer(async (req, res) => {
                     res.write(`data: ${JSON.stringify(openAiChunk)}\n\n`);
                   }
                   if (b4mChunk.stopReason) {
-                    finishReasonToUse = b4mChunk.stopReason === 'end_turn' ? 'stop' : (b4mChunk.stopReason === 'max_tokens' ? 'length' : b4mChunk.stopReason);
-                    emitFinishIfNeeded();
+                    // Record finishReasonToUse, but do NOT prematurely emit finish chunk before [DONE]
+                    finishReasonToUse = b4mChunk.stopReason === 'end_turn'
+                      ? 'stop'
+                      : (b4mChunk.stopReason === 'max_tokens' ? 'length' : b4mChunk.stopReason);
                   }
                 } else if (b4mChunk.type === 'tool_use' && Array.isArray(b4mChunk.tools)) {
                   hasToolCalls = true;
@@ -482,7 +497,7 @@ http.createServer(async (req, res) => {
                               type: 'function',
                               function: {
                                 name: tool.name,
-                                arguments: typeof tool.arguments === 'string' ? tool.arguments : JSON.stringify(tool.arguments || {})
+                                arguments: formatToolArgs(tool.arguments)
                               }
                             }]
                           },
@@ -533,7 +548,7 @@ http.createServer(async (req, res) => {
                     type: 'function',
                     function: {
                       name: t.name,
-                      arguments: typeof t.arguments === 'string' ? t.arguments : JSON.stringify(t.arguments || {})
+                      arguments: formatToolArgs(t.arguments)
                     }
                   })));
                 }
@@ -563,7 +578,6 @@ http.createServer(async (req, res) => {
             } : undefined
           };
 
-          clearInterval(keepaliveTimer);
           res.writeHead(200, {
             'Content-Type': 'application/json',
             'Access-Control-Allow-Origin': '*'
@@ -571,7 +585,11 @@ http.createServer(async (req, res) => {
         }
       } catch (err) {
         console.error('[Proxy Error]:', err);
-        res.writeHead(500, { 'Content-Type': 'application/json' }).end(JSON.stringify({ error: err.message }));
+        if (!res.headersSent) {
+          res.writeHead(500, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }).end(JSON.stringify({ error: err.message }));
+        } else {
+          res.end();
+        }
       }
     });
   }
