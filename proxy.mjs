@@ -213,11 +213,24 @@ http.createServer(async (req, res) => {
           payload.model = 'claude-opus-5-5';
         }
 
-        // Ensure full 128k output token budget so Claude's extended thinking (3-4k tokens)
-        // + large file writes (like render.ts) never hit the default 4,096 token limit
-        if (!payload.max_tokens || payload.max_tokens < 128000) {
-          payload.max_tokens = 128000;
-          payload.maxTokens = 128000;
+        // Detect compaction or summarization requests
+        const isCompaction = payload.model?.includes('haiku') || (Array.isArray(payload.messages) && payload.messages.some(m => {
+          const str = typeof m.content === 'string' ? m.content : JSON.stringify(m.content || '');
+          return /compact|summarize conversation|summarise conversation|summary of the conversation|conversation history/i.test(str);
+        }));
+
+        if (isCompaction) {
+          payload.model = 'claude-haiku-5-5';
+          payload.max_tokens = 4096;
+          payload.maxTokens = 4096;
+          console.log('[Proxy] Compaction request detected -> auto-routed to claude-haiku-5-5 (max_tokens: 4096) for ultra-low credit cost.');
+        } else {
+          // Ensure full 128k output token budget so Claude's extended thinking (3-4k tokens)
+          // + large file writes (like render.ts) never hit the default 4,096 token limit
+          if (!payload.max_tokens || payload.max_tokens < 128000) {
+            payload.max_tokens = 128000;
+            payload.maxTokens = 128000;
+          }
         }
 
         // Default reasoning effort to medium for reasoning-capable models if not explicitly set
@@ -255,10 +268,16 @@ http.createServer(async (req, res) => {
 
           for (const msg of payload.messages) {
             if (msg.role === 'tool') {
+              let toolText = typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content ?? '');
+              // If historical tool output is huge, truncate the middle to drastically reduce prompt tokens
+              if (toolText.length > 3000) {
+                toolText = toolText.slice(0, 1500) + '\n...[historical tool output truncated]...\n' + toolText.slice(-500);
+              }
+
               const toolResultBlock = {
                 type: 'tool_result',
                 tool_use_id: msg.tool_call_id || '',
-                content: typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content ?? '')
+                content: toolText
               };
 
               const prev = translatedMessages[translatedMessages.length - 1];
@@ -276,7 +295,11 @@ http.createServer(async (req, res) => {
               if (typeof msg.content === 'string' && msg.content.trim()) {
                 contentBlocks.push({ type: 'text', text: msg.content });
               } else if (Array.isArray(msg.content)) {
-                contentBlocks.push(...msg.content);
+                for (const b of msg.content) {
+                  // Do not echo back internal reasoning/thinking blocks from earlier turns (saves megabytes of tokens)
+                  if (b && (b.type === 'thinking' || b.type === 'reasoning')) continue;
+                  contentBlocks.push(b);
+                }
               }
 
               if (Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0) {
