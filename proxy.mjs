@@ -118,6 +118,11 @@ class KeyPoolManager {
     }
   }
 
+  reset() {
+    this.depleted.clear();
+    console.log('[KeyPool] All keys have been reset and marked available.');
+  }
+
   getStatus() {
     this.loadKeys(true);
     const active = this.keys.filter(k => !this.depleted.has(k));
@@ -141,9 +146,23 @@ console.log(`[KeyPool] Initialized with ${pool.keys.length} key(s) detected.`);
 // Checks if an upstream response indicates key exhaustion / invalidation
 function isDepletionError(status, bodyText) {
   if (status === 401) return 'unauthorized / revoked';
-  if (status === 403 && /quota|limit|credit|forbidden/i.test(bodyText)) return 'forbidden / quota exceeded';
-  if (status === 422 && /insufficient_credits|spend_cap_exceeded|balance|credit/i.test(bodyText)) return 'insufficient_credits';
-  if (status === 429 && /quota|credit/i.test(bodyText)) return 'quota_exhausted';
+  if (status === 403 && /quota|limit|forbidden/i.test(bodyText)) return 'forbidden / quota exceeded';
+  if (status === 422) {
+    try {
+      const parsed = JSON.parse(bodyText);
+      const err = parsed.error || parsed.errorCode || '';
+      const msg = parsed.message || '';
+      if (typeof err === 'string' && /insufficient_credits|spend_cap_exceeded|balance_too_low|quota_exceeded/i.test(err)) {
+        return err;
+      }
+      if (typeof msg === 'string' && /insufficient.*credit|not enough credit|spend.*cap/i.test(msg)) {
+        return 'insufficient_credits';
+      }
+    } catch (_) {
+      if (/insufficient_credits|spend_cap_exceeded/i.test(bodyText)) return 'insufficient_credits';
+    }
+  }
+  if (status === 429 && /quota|rate_limit_exceeded/i.test(bodyText)) return 'quota_exhausted';
   return false;
 }
 
@@ -158,8 +177,11 @@ http.createServer(async (req, res) => {
     return;
   }
 
-  // Health check & Key Pool status
+  // Health check & Key Pool status (with optional ?reset=true or /reset endpoint)
   if (req.method === 'GET') {
+    if (req.url === '/reset' || req.url === '/v1/reset' || req.url?.includes('reset=true')) {
+      pool.reset();
+    }
     res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify({
       status: 'ok',
       provider: 'Bike4Mind Proxy (with Auto-Key Failover)',
