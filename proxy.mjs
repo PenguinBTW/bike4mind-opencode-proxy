@@ -463,28 +463,37 @@ http.createServer(async (req, res) => {
         delete payload.stream_options;
 
         // Model aliases for convenient selection
-        if (payload.model === 'claude-3-5-sonnet' || payload.model === 'sonnet-5.5' || payload.model === 'sonnet') {
+        if (/sonnet/i.test(payload.model)) {
           payload.model = 'claude-sonnet-5-5';
-        } else if (payload.model === 'claude-3-5-haiku' || payload.model === 'haiku-5.5' || payload.model === 'haiku') {
-          payload.model = 'claude-haiku-5-5';
-        } else if (payload.model === 'opus-5.5' || payload.model === 'opus') {
+        } else if (/opus/i.test(payload.model)) {
           payload.model = 'claude-opus-5-5';
+        } else if (/haiku/i.test(payload.model)) {
+          payload.model = 'claude-haiku-5-5';
         }
 
-        // Detect compaction or summarization requests
-        const isCompaction = payload.model?.includes('haiku') || (Array.isArray(payload.messages) && payload.messages.some(m => {
-          const str = typeof m.content === 'string' ? m.content : JSON.stringify(m.content || '');
-          return /compact|summarize conversation|summarise conversation|summary of the conversation|conversation history/i.test(str);
-        }));
+        // Detect true compaction/summarization requests:
+        // CRITICAL INVARIANT: Active agent coding turns ALWAYS carry tools (write, edit, bash, read).
+        // A true compaction request NEVER carries tools and has an explicit summarization instruction in the LAST message.
+        const hasTools = Array.isArray(payload.tools) && payload.tools.length > 0;
+        const lastMsg = Array.isArray(payload.messages) && payload.messages.length > 0 
+          ? payload.messages[payload.messages.length - 1] 
+          : null;
+        const lastText = typeof lastMsg?.content === 'string' 
+          ? lastMsg.content 
+          : JSON.stringify(lastMsg?.content || '');
+
+        const isCompaction = !hasTools && (
+          /(?:provide a (?:detailed )?summary of the (?:preceding )?conversation|summarize (?:the )?preceding conversation|compact (?:the |this )?(?:conversation|session)|summarize our conversation so far)/i.test(lastText)
+        );
 
         if (isCompaction) {
           payload.model = 'claude-haiku-5-5';
           payload.max_tokens = 4096;
           payload.maxTokens = 4096;
-          console.log('[Proxy] Compaction request detected -> auto-routed to claude-haiku-5-5 (max_tokens: 4096) for ultra-low credit cost.');
+          console.log('[Proxy] True compaction request detected -> auto-routed to claude-haiku-5-5 (max_tokens: 4096) for ultra-low credit cost.');
         } else {
-          // Ensure full 128k output token budget so Claude's extended thinking (3-4k tokens)
-          // + large file writes (like render.ts) never hit the default 4,096 token limit
+          // Ensure full 128k output token budget so Opus/Sonnet's extended thinking (3-4k tokens)
+          // + large file writes (like full scene prompts or render scripts) NEVER hit 4,096 truncation limits!
           if (!payload.max_tokens || payload.max_tokens < 128000) {
             payload.max_tokens = 128000;
             payload.maxTokens = 128000;
